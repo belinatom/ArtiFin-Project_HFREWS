@@ -33,10 +33,13 @@ and the resulting labelling / anomaly detection ''''
 '''' All the packages have been installed via command line and therefore only importing them
 here instead of installing them again ''''
 
-import argparse
-import warnings
+import argparse 
+#allows running commands from the commandline such as running this py file on Anaconda prompt. 
 
-import mlflow
+import warnings
+# Used to control Python warning messages.
+
+import mlflow # for experiment tracking
 import mlflow.sklearn
 import numpy as np
 import pandas as pd
@@ -48,9 +51,7 @@ from sklearn.svm import OneClassSVM
 warnings.filterwarnings("ignore")
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Feature definitions
-# ─────────────────────────────────────────────────────────────────────────────
+# ----------- FEATURE PRE-PROCESSING AND DEFINITION -------------
 
 DRAINAGE_RISK_SCORES = {
     "SE": 1,
@@ -59,9 +60,9 @@ DRAINAGE_RISK_SCORES = {
     "P":  4,
     "VP": 5,
 }
-DRAINAGE_RISK_DEFAULT = 2
 
-# Clean 13-feature set — best balance of signal and redundancy
+# Clean features list for next steps
+
 DYNAMIC_FEATURES = [
     "rain_1d",
     "rain_3d_sum",
@@ -83,9 +84,8 @@ TERRAIN_FEATURES = [
 
 STATIC_FEATURES = TERRAIN_FEATURES  # alias for data loading
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Experiment registry
-# ─────────────────────────────────────────────────────────────────────────────
+# EXPERIMENT REGISTRY
+'''' Prepares the experiment environment ''''
 
 EXPERIMENTS = [
     {
@@ -122,6 +122,7 @@ EXPERIMENTS = [
 RISK_THRESHOLDS = {
     "p_orange": 70,
     "p_red":    90,
+    
 }
 
 
