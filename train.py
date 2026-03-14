@@ -1,45 +1,46 @@
 # ----------- TRAINING: TANZANIAN PRIMARY HEALTHCARE FACILITIES INACCESSIBILITY RISK —-----------------------
 # --ANOMALY & RISK DETECTION PIPELINE FROM RAINFALL AND ANTECEDENT ENVIRONMENT CONDITIONS──────────
-''' Runs 4 experiments to detect health facilities at risk of being cut off 
-due to heavy rainfall and antecedent environmental conditions.''''
+''' The script runs 4 experiments to detect health facilities at risk of being cut off 
+due to heavy rainfall and antecedent environmental conditions and selects the best performing model from the experiment to build a predict pipeline'''
 
 #-------------- DEFINITION OF FEATURES BEING USED FOR MODEL TRAINING ---------------
-''''Dynamic Features - this includes all the features that change daily or from time to time. It include features derived from rainfall and soil moisture
+'''Dynamic Features - this includes all the features that change daily or from time to time. It include features derived from rainfall and soil moisture
 Terrain or Static Features - Includes all features that stay mostly constant for a long period of time. It includes the elevation where a facility is placed,
-the slope and the drainage capacity of the soil in the environment the facility is located.''''
+the slope and the drainage capacity of the soil in the environment the facility is located.'''
 
-# --------------------- MODEL SELECTION JUSTIFICATION ------------------------------------'
-'''' Isolation Forest - 
+# --------------------- MODEL SELECTION JUSTIFICATION ------------------------------------
+'''Isolation Forest - 
 One Class SVM - '''
 
 # ------------------ PRE-DEFINING THE EXPERIMENTS THAT WILL BE RUN IN THIS TRAINING PIPELINE ------
 ''' Two models are used in this training pipeline and 2 experiments are conducted for each model varying the type of parameters 
 included in the model. The variation includes adding or removing static features to see how antecedent static features affect or not affect the risk score 
-and the resulting labelling / anomaly detection ''''
+and the resulting labelling / anomaly detection '''
 
 #   Experiment 1 — Isolation Forest   | Dynamic features only
 #   Experiment 2 — Isolation Forest   | Dynamic + Terrain features
 #   Experiment 3 — One-Class SVM      | Dynamic features only
 #   Experiment 4 — One-Class SVM      | Dynamic + Terrain features
 
-# ----------- ANOMALY DETECTION RISK SCORES DEFINITION 
-''''Anomaly scores are normalised to [0, 1] and binned into three risk classes
-# using percentile thresholds (more statistically robust than fixed cut-offs):
-#   Green  — 0 – 70th percentile
-#   Orange — 70th – 90th percentile
-#   Red    — > 90th percentile ''''
+# ----------- ANOMALY DETECTION RISK SCORES DEFINITION
+'''Anomaly scores are normalised to [0, 1] and binned into three risk classes
+using percentile thresholds (more statistically robust than fixed cut-offs):
+  Green  — 0 – 70th percentile
+  Orange — 50th – 90th percentile
+  Red    — > 90th percentile '''
 
 # ------------- ENVIRONMENT PREPARATION ---------------------
-'''' All the packages have been installed via command line and therefore only importing them
-here instead of installing them again ''''
+''' All the packages have been installed via conda command line and therefore only importing them
+here instead of installing them again '''
 
-import argparse 
-#allows running commands from the commandline such as running this py file on Anaconda prompt. 
+
+import argparse
+# allows running commands from the commandline such as running this py file on Anaconda prompt.
 
 import warnings
 # Used to control Python warning messages.
 
-import mlflow # for experiment tracking
+import mlflow  # for experiment tracking
 import mlflow.sklearn
 import numpy as np
 import pandas as pd
@@ -52,16 +53,6 @@ warnings.filterwarnings("ignore")
 
 
 # ----------- FEATURE PRE-PROCESSING AND DEFINITION -------------
-
-DRAINAGE_RISK_SCORES = {
-    "SE": 1,
-    "MW": 2,
-    "I":  3,
-    "P":  4,
-    "VP": 5,
-}
-
-# Clean features list for next steps
 
 DYNAMIC_FEATURES = [
     "rain_1d",
@@ -76,16 +67,13 @@ DYNAMIC_FEATURES = [
     "sm_change_3d",
 ]
 
-TERRAIN_FEATURES = [
-    "elevation_m",   # elevation
-    "slope_deg",     # slope
-    "drainage_risk", # drainage_pattern (encoded from DRAINAGE column)
+STATIC_FEATURES = [
+    "elevation_m",              # elevation
+    "water_accumulation_index", # combines drainage and slope to produce a water accumulation risk score
 ]
 
-STATIC_FEATURES = TERRAIN_FEATURES  # alias for data loading
-
-# EXPERIMENT REGISTRY
-'''' Prepares the experiment environment ''''
+# ------------------------------EXPERIMENT REGISTRY---------------------------------
+''' Prepares the experiment environment '''
 
 EXPERIMENTS = [
     {
@@ -93,13 +81,13 @@ EXPERIMENTS = [
         "name":     "IsolationForest_Dynamic",
         "model":    "IsolationForest",
         "features": DYNAMIC_FEATURES,
-        "desc":     "Test if climate variables alone detect risk",
+        "desc":     "Testing if climate variables alone detect risk",
     },
     {
         "id":       2,
         "name":     "IsolationForest_Dynamic_Terrain",
         "model":    "IsolationForest",
-        "features": DYNAMIC_FEATURES + TERRAIN_FEATURES,
+        "features": DYNAMIC_FEATURES + STATIC_FEATURES,
         "desc":     "Does terrain improve anomaly detection?",
     },
     {
@@ -107,99 +95,77 @@ EXPERIMENTS = [
         "name":     "OneClassSVM_Dynamic",
         "model":    "OneClassSVM",
         "features": DYNAMIC_FEATURES,
-        "desc":     "Compare anomaly detection methods — dynamic only",
+        "desc":     "Comparing anomaly detection methods — dynamic feature only and same logic to see if climate variables alone detect anomaly",
     },
     {
         "id":       4,
         "name":     "OneClassSVM_Dynamic_Terrain",
         "model":    "OneClassSVM",
-        "features": DYNAMIC_FEATURES + TERRAIN_FEATURES,
-        "desc":     "Best performing configuration candidate",
+        "features": DYNAMIC_FEATURES + STATIC_FEATURES,
+        "desc":     "Does terrain improve anomaly detection for OCSVM?",
     },
 ]
 
-# Percentile thresholds for risk classification
+# Percentile thresholds for risk classification for the models
+''' the model automatically considers anything below 50 as normal therefore there is no need for another threshold'''
+
 RISK_THRESHOLDS = {
-    "p_orange": 70,
+    "p_orange": 50,
     "p_red":    90,
-    
 }
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Step 1 — Load each data source from disk
-# ─────────────────────────────────────────────────────────────────────────────
+# ---------------------------- DATA ANALYSIS PREPARATION -----------------------------------
+
+# STEP 1: DATA LOADING FUNCTIONS PREPARATIONS
 
 def load_static_features(path):
     """Loads hfr_data.csv and prepares static + terrain features per facility."""
-    df = pd.read_csv(path)
+    df = pd.read_csv(path, encoding="latin-1")
 
     df["facility_id"] = (
-        df["lat"].round(5).astype(str)
-        + "_"
-        + df["lon"].round(5).astype(str)
-    )
-
-    # Encode soil drainage property → ordinal drainage risk score
-    df["drainage_risk"] = (
-        df["DRAINAGE"]
-        .map(DRAINAGE_RISK_SCORES)
-        .fillna(DRAINAGE_RISK_DEFAULT)
-        .astype(int)
-    )
-
-    # Region-median imputation for continuous terrain features
-    for col in ["elevation_m", "slope_deg"]:
-        df[col] = df.groupby("region")[col].transform(
-            lambda x: x.fillna(x.median())
-        )
+        df["lat"].round(5).astype(str) + "_" + df["lon"].round(5).astype(str)
+    ) #creates a facility ID column using latitude and longitude combination for the ID
 
     static_df = df[
-        ["facility_id", "name", "region", "facility_class", "lat", "lon"]
+        ["facility_id", "name", "region", "facility_type", "lat", "lon"]
         + STATIC_FEATURES
-    ].copy()
-
-    print(f"Loaded {len(static_df):,} facilities from {path}")
-    print(f"  DRAINAGE risk distribution : {df['drainage_risk'].value_counts().sort_index().to_dict()}")
-    print(f"  Missing after imputation   — elevation: {df['elevation_m'].isna().sum()}, slope: {df['slope_deg'].isna().sum()}")
+    ].copy() # combines the newly engineered features of elevation and WAI with the facility admin info
 
     return static_df
 
 
 def load_rainfall_features(path):
-    """Loads pre-computed rainfall features CSV."""
-    df = pd.read_csv(path, parse_dates=["date"])
-    print(f"Loaded rainfall features      : {df.shape} from {path}")
+    """Loads the pre-computed rainfall features CSV."""
+    df = pd.read_csv(path, encoding="latin-1", parse_dates=["date"])
     return df
 
 
 def load_soil_moisture_features(path):
-    """Loads pre-computed soil moisture features CSV."""
-    df = pd.read_csv(path, parse_dates=["date"])
-    print(f"Loaded soil moisture features : {df.shape} from {path}")
+    """Loads the pre-computed soil moisture features CSV."""
+    df = pd.read_csv(path, encoding="latin-1", parse_dates=["date"])
     return df
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Step 2 — Merge all three sources
-# ─────────────────────────────────────────────────────────────────────────────
+# STEP 2: MERGING STATIC FEATURES AND THE DYNAMIC RAINFALL AND SOIL MOISTURE DATAFRAMES
 
 def merge_all_sources(static_df, rain_df, sm_df):
-    """Inner-joins rainfall + soil moisture on facility_id/date, then left-joins static."""
-    # Coerce date columns to same dtype (handles mixed date format strings)
     rain_df = rain_df.copy()
     sm_df   = sm_df.copy()
+
     rain_df["date"] = pd.to_datetime(rain_df["date"], format="mixed")
     sm_df["date"]   = pd.to_datetime(sm_df["date"],   format="mixed")
 
     dynamic = rain_df.merge(sm_df, on=["facility_id", "date"], how="inner")
-    merged  = dynamic.merge(
-        static_df[["facility_id"] + STATIC_FEATURES + ["name", "region"]],
+
+    merged = dynamic.merge(
+        static_df[["facility_id", "name", "region"] + STATIC_FEATURES],
         on="facility_id",
         how="left",
     )
 
-    unmatched = merged[STATIC_FEATURES[0]].isna().sum()
+    unmatched = merged["water_accumulation_index"].isna().sum()
+
     print(f"\nMerge summary:")
     print(f"  Rainfall rows      : {len(rain_df):,}")
     print(f"  Soil moisture rows : {len(sm_df):,}")
@@ -208,33 +174,31 @@ def merge_all_sources(static_df, rain_df, sm_df):
     return merged
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Step 3 — Reference labels (evaluation only — NOT used in model training)
-# ─────────────────────────────────────────────────────────────────────────────
+# Step 2 — REFERENCE LABELS FOR EVALUATION ONLY 
 
 def assign_reference_labels(df):
     """
     Rule-based labels to evaluate how well unsupervised scores separate risk tiers.
     Models are trained without these labels (fully unsupervised).
 
-      CUTOFF_HIGH     — saturated soils + heavy recent rain
-      CUTOFF_MODERATE — elevated antecedent conditions + meaningful rain
-      CUTOFF_WATCH    — positive rain anomaly + soil above median
+      CUTOFF_HIGH     — rain spike (historically high + above recent avg) + SM spike + high WAI
+      CUTOFF_MODERATE — rain spike + SM spike + moderate WAI
+      CUTOFF_WATCH    — rain spike + SM spike + low WAI
       NO_ALERT        — no concerning conditions
     """
     def label_row(row):
-        if (row["rain_1d"]        >= 15
-                and row["rain_7d_sum"]   >= 60
-                and row["sm_p90_flag"]   == 1
-                and row["rain_p90_flag"] == 1):
+        rain_spike = (
+            row["rain_1d"] > (row["rain_7d_sum"] / 7)   # today exceeds recent daily average
+            and row["rain_percentile"] > 75              # and is historically high
+        )
+        sm_spike = row["sm_1d"] > row["sm_7d_mean"]      # today's SM exceeds recent mean
+        wai      = row["water_accumulation_index"]
+
+        if rain_spike and sm_spike and wai >= 0.65:
             return "CUTOFF_HIGH"
-        if (row["rain_1d"]        >= 8
-                and row["rain_7d_sum"]   >= 35
-                and row["sm_percentile"] >  60):
+        if rain_spike and sm_spike and 0.35 <= wai < 0.65:
             return "CUTOFF_MODERATE"
-        if (row["rain_1d"]        >= 3
-                and row["rain_anomaly"]  >   5
-                and row["sm_percentile"] >  50):
+        if rain_spike and sm_spike and wai < 0.35:
             return "CUTOFF_WATCH"
         return "NO_ALERT"
 
@@ -248,23 +212,21 @@ def assign_reference_labels(df):
     return df
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Step 4 — Anomaly scoring and risk classification
-# ─────────────────────────────────────────────────────────────────────────────
+# STEP 4: MODELING - MODEL PREPARATION
 
 def build_model(model_type: str) -> Pipeline:
     """Returns a StandardScaler + anomaly detector pipeline."""
     if model_type == "IsolationForest":
         detector = IsolationForest(
             n_estimators=200,
-            contamination=0.10,   # ~10% of rows expected to be anomalous
+            contamination=0.20,   # ~20% of rows expected to be anomalous
             random_state=42,
             n_jobs=-1,
         )
     elif model_type == "OneClassSVM":
         detector = OneClassSVM(
             kernel="rbf",
-            nu=0.10,              # upper bound on fraction of anomalies
+            nu=0.20,              # upper bound on fraction of anomalies
             gamma="scale",
         )
     else:
@@ -275,6 +237,8 @@ def build_model(model_type: str) -> Pipeline:
         ("detector", detector),
     ])
 
+
+# STEP 5: ANOMALY SCORE COMPUTATION 
 
 def compute_anomaly_scores(pipeline: Pipeline, X: np.ndarray, model_type: str) -> np.ndarray:
     """
@@ -292,37 +256,50 @@ def compute_anomaly_scores(pipeline: Pipeline, X: np.ndarray, model_type: str) -
         return -detector.decision_function(X_scaled)
 
 
-def normalise_scores(raw_scores: np.ndarray) -> np.ndarray:
-    """Min-max normalise anomaly scores to [0, 1]."""
-    scaler = MinMaxScaler()
-    return scaler.fit_transform(raw_scores.reshape(-1, 1)).flatten()
+# STEP 6: SCORE NORMALIZATION AND FIXED ALERT THRESHOLD SETTINGS FOR THE MODEL. 
+
+def normalise_scores(raw_scores: np.ndarray, scaler: MinMaxScaler = None):
+    """
+    Stable min-max scaling.
+    If scaler is None → fit on training scores.
+    If scaler exists  → reuse it.
+    """
+    if scaler is None:
+        scaler = MinMaxScaler()
+        norm_scores = scaler.fit_transform(raw_scores.reshape(-1, 1)).flatten()
+    else:
+        norm_scores = scaler.transform(raw_scores.reshape(-1, 1)).flatten()
+
+    return norm_scores, scaler
 
 
-def classify_risk(norm_scores: np.ndarray):
-    """
-    Percentile-based risk classification.
-      0 – 70th pct  → Green
-      70 – 90th pct → Orange
-      > 90th pct    → Red
-    """
-    p_orange = np.percentile(norm_scores, RISK_THRESHOLDS["p_orange"])
-    p_red    = np.percentile(norm_scores, RISK_THRESHOLDS["p_red"])
+def compute_alert_thresholds(norm_scores: np.ndarray):
+    """Compute thresholds ONCE from training scores."""
+    orange = np.percentile(norm_scores, 70)
+    red    = np.percentile(norm_scores, 90)
+    return {"orange": orange, "red": red}
+
+
+def classify_risk(norm_scores: np.ndarray, thresholds: dict):
+    """Use fixed thresholds instead of recomputing each run."""
+    orange = thresholds["orange"]
+    red    = thresholds["red"]
 
     classes = np.where(
-        norm_scores > p_red,
+        norm_scores > red,
         "Red",
-        np.where(norm_scores > p_orange, "Orange", "Green")
+        np.where(norm_scores > orange, "Orange", "Green")
     )
-    return classes, p_orange, p_red
+
+    return classes, orange, red
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Step 5 — Evaluate alignment with reference labels
-# ─────────────────────────────────────────────────────────────────────────────
+
+# Step 7 — EVALUATION: COMPARISON WITH REFERENCE LABELS 
 
 def evaluate_alignment(risk_classes: np.ndarray, ref_labels: np.ndarray) -> dict:
     """
-    Measures how well unsupervised risk classes align with rule-based labels.
+    Measures how well unsupervised risk classes align with rule-based labels created prior.
     Key metrics:
       high_red_rate        — fraction of CUTOFF_HIGH rows assigned Red
       no_alert_green_rate  — fraction of NO_ALERT rows assigned Green
@@ -347,8 +324,8 @@ def evaluate_alignment(risk_classes: np.ndarray, ref_labels: np.ndarray) -> dict
     high_red = results.get("CUTOFF_HIGH", {}).get("Red",   0.0)
     no_green = results.get("NO_ALERT",    {}).get("Green", 0.0)
 
-    results["high_red_rate"]        = high_red
-    results["no_alert_green_rate"]  = no_green
+    results["high_red_rate"]       = high_red
+    results["no_alert_green_rate"] = no_green
     results["alignment_score"] = (
         round(2 * high_red * no_green / (high_red + no_green), 4)
         if (high_red + no_green) > 0 else 0.0
@@ -357,9 +334,7 @@ def evaluate_alignment(risk_classes: np.ndarray, ref_labels: np.ndarray) -> dict
     return results
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Step 6 — Run one experiment and log to MLflow
-# ─────────────────────────────────────────────────────────────────────────────
+# Step 8 — RUNNING EXPERIMENTS
 
 def run_experiment(df: pd.DataFrame, exp: dict) -> dict:
     """Fits one anomaly model, scores all rows, classifies risk, logs to MLflow."""
@@ -381,9 +356,10 @@ def run_experiment(df: pd.DataFrame, exp: dict) -> dict:
     pipeline = build_model(model_type)
     pipeline.fit(X)
 
-    raw_scores               = compute_anomaly_scores(pipeline, X, model_type)
-    norm_scores              = normalise_scores(raw_scores)
-    risk_classes, p_orange, p_red = classify_risk(norm_scores)
+    raw_scores                    = compute_anomaly_scores(pipeline, X, model_type)
+    norm_scores, _                = normalise_scores(raw_scores)
+    thresholds                    = compute_alert_thresholds(norm_scores)
+    risk_classes, p_orange, p_red = classify_risk(norm_scores, thresholds)
 
     alignment   = evaluate_alignment(risk_classes, ref_labels)
     risk_counts = pd.Series(risk_classes).value_counts()
@@ -403,7 +379,7 @@ def run_experiment(df: pd.DataFrame, exp: dict) -> dict:
     print(f"  NO_ALERT    → Green rate   : {alignment['no_alert_green_rate']:.0%}")
     print(f"  Alignment score (harmonic) : {alignment['alignment_score']:.4f}")
 
-    # ── MLflow logging ──────────────────────────────────────────────────────
+# Step 9: MLFLOW LOGGING - LOGGING THE EXPERIMENT TO MLFLOW. 
     with mlflow.start_run(run_name=run_name) as run:
         mlflow.log_params({
             "experiment_id":   exp_id,
@@ -412,7 +388,7 @@ def run_experiment(df: pd.DataFrame, exp: dict) -> dict:
             "n_features":      len(features),
             "features":        ", ".join(features),
             "n_rows":          len(df),
-            "contamination":   0.10,
+            "contamination":   0.20,
             "p_orange_thresh": RISK_THRESHOLDS["p_orange"],
             "p_red_thresh":    RISK_THRESHOLDS["p_red"],
         })
@@ -467,10 +443,11 @@ def run_experiment(df: pd.DataFrame, exp: dict) -> dict:
         "high_red_rate":   alignment["high_red_rate"],
     }
 
+##########################################################################################
+############## --------------------- MAIN PIPELINE APPLICATION ---------------------------
+##########################################################################################
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Main
-# ─────────────────────────────────────────────────────────────────────────────
+''' All the functions and steps created above are now combined into a single pipeline in this stage '''
 
 def main():
     parser = argparse.ArgumentParser(
