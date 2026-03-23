@@ -1,306 +1,383 @@
-# predict.py
-#
-# Runs the full prediction pipeline:
-#   1. Pulls fresh rainfall data from GEE (uses cached baseline parquet)
-#   2. Pulls fresh soil moisture data from GEE (uses cached baseline parquet)
-#   3. Loads static facility features from hfr_data.csv
-#   4. Merges all three sources
-#   5. Loads the trained model from MLflow
-#   6. Scores all facilities and saves predictions to a CSV
-#
-# Usage:
-#   python predict.py \
-#       --static      hfr_data.csv \
-#       --rain_cache  chirps_baseline.parquet \
-#       --sm_cache    era5_baseline.parquet \
-#       --ee_project  mhews-tz
-#
-# Output:
-#   predictions_YYYY-MM-DD.csv
+"""
+predict.py  —  Flood EWS Prediction Engine + FastAPI
 
+Uses Exp2_IF_AllFeatures (IsolationForest, dynamic + terrain features)
+— the best performing model from train.py.
 
+Modes
+-----
+  CLI   python predict.py --date 2024-03-15
+  API   uvicorn predict:app --host 0.0.0.0 --port 8000
+        then open  http://localhost:8000/docs
+
+Endpoints
+---------
+  POST /predict/manual          enter feature values → get risk score + label
+  GET  /predict                 score all facilities for a date (latest default)
+  GET  /predict?date=YYYY-MM-DD score all facilities for a specific date
+  GET  /risk/high               High Risk facilities only
+  GET  /risk/summary            risk count breakdown
+  GET  /facility/{id}           single facility detail
+  GET  /health                  model status
+
+Dependencies
+------------
+  pip install fastapi uvicorn joblib numpy pandas scikit-learn pyarrow
+"""
+
+# ── Standard library ──────────────────────────────────────────────────────────
 import argparse
+import logging
 import os
-import tempfile
-import warnings
-from datetime import date
+from contextlib import asynccontextmanager
 from pathlib import Path
+from typing import Optional
 
-import mlflow.sklearn
+# ── Third-party ───────────────────────────────────────────────────────────────
+import joblib
+import numpy as np
 import pandas as pd
+from fastapi import FastAPI, HTTPException, Query
+from pydantic import BaseModel, Field
 
-warnings.filterwarnings("ignore")
+# ── Logging ───────────────────────────────────────────────────────────────────
+logging.basicConfig(
+    format="%(asctime)s | %(levelname)s | %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+    level=logging.INFO,
+)
+log = logging.getLogger(__name__)
 
+# ── Paths (resolve relative to this script's directory) ───────────────────────
+BASE_DIR    = Path(__file__).resolve().parent
+MODELS_DIR  = str(BASE_DIR / "models")
+STATIC_FILE = str(BASE_DIR / "hfr_data.csv")
+HAZARD_FILE = str(BASE_DIR / "daily_hazard.parquet")
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Settings
-# ─────────────────────────────────────────────────────────────────────────────
+# ── Production model — best experiment from train.py ─────────────────────────
+PRODUCTION_MODEL = "Exp2_IF_AllFeatures.pkl"
 
-MLFLOW_DB     = "sqlite:///mlflow_cutoff_alerts.db"
-MODEL_NAME    = "FacilityCutoffRiskClassifier"
-MODEL_VERSION = "latest"
-
-DRAINAGE_RISK_SCORES = {
-    "SE": 1,
-    "MW": 2,
-    "I":  3,
-    "P":  4,
-    "VP": 5,
-}
-DRAINAGE_RISK_DEFAULT = 2
-
-RAINFALL_FEATURES = [
-    "rain_1d",
-    "rain_3d_sum",
-    "rain_7d_sum",
-    "rain_14d_sum",
-    "rain_percentile",
-    "rain_p90_flag",
-    "rain_p95_flag",
-    "rain_anomaly",
-    "rain_days_above_20mm",
+# ── Feature columns the production model was trained on ───────────────────────
+FEATURES = [
+    "rain_1d", "rain_3d_sum", "rain_7d_sum", "rain_percentile", "rain_anomaly",
+    "river_discharge_m3s", "discharge_percentile",
+    "swi_raw", "swi_absorption_deficit", "swi_7d_mean", "swi_3d_trend", "swi_percentile",
+    "runoff_1d", "runoff_3d_sum", "runoff_7d_sum", "runoff_percentile",
+    "water_accumulation_index", "dist_to_river_km",
 ]
 
-SOIL_MOISTURE_FEATURES = [
-    "sm_1d",
-    "sm_7d_mean",
-    "sm_percentile",
-    "sm_p90_flag",
-    "sm_p95_flag",
-    "sm_14d_mean",
-    "sm_change_3d",
-    "sm_change_7d",
-]
 
-STATIC_FEATURES = [
-    "elevation_m",
-    "slope_deg",
-    "drainage_risk",
-    "TEXTURE_USDA",
-]
+# ══════════════════════════════════════════════════════════════════════════════
+# MODEL STORE — loaded once, shared across all requests
+# ══════════════════════════════════════════════════════════════════════════════
+class ModelStore:
+    pipeline  = None   # sklearn Pipeline: StandardScaler + IsolationForest
+    static_df = None   # facility attribute table
+    hazard_df = None   # daily hazard feature table
 
-ALL_FEATURES = RAINFALL_FEATURES + SOIL_MOISTURE_FEATURES + STATIC_FEATURES
+    @classmethod
+    def load(cls,
+             models_dir:  str = MODELS_DIR,
+             static_file: str = STATIC_FILE,
+             hazard_file: str = HAZARD_FILE) -> None:
+        model_path  = os.path.join(models_dir, PRODUCTION_MODEL)
+        cls.pipeline = joblib.load(model_path)
+        log.info("Loaded model: %s", model_path)
 
+        cls.static_df = pd.read_csv(static_file, encoding="latin1")
+        # Add facility_id as row position if not already present
+        # (train.py now saves it, but guard for older CSVs)
+        if "facility_id" not in cls.static_df.columns:
+            cls.static_df.insert(0, "facility_id", range(len(cls.static_df)))
+        cls.static_df["facility_id"] = cls.static_df["facility_id"].astype(int)
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Step 1 — Load static facility features
-# ─────────────────────────────────────────────────────────────────────────────
+        cls.hazard_df = pd.read_parquet(hazard_file)
+        cls.hazard_df["date"] = pd.to_datetime(cls.hazard_df["date"])
 
-def load_static_features(path):
-    """Loads hfr_data.csv and prepares static features and the facilities lookup table."""
-    df = pd.read_csv(path)
-
-    df["facility_id"] = (
-        df["lat"].round(5).astype(str)
-        + "_"
-        + df["lon"].round(5).astype(str)
-    )
-
-    df["drainage_risk"] = (
-        df["DRAINAGE"]
-        .map(DRAINAGE_RISK_SCORES)
-        .fillna(DRAINAGE_RISK_DEFAULT)
-        .astype(int)
-    )
-
-    df["TEXTURE_USDA"] = df["TEXTURE_USDA"].fillna(df["TEXTURE_USDA"].median())
-
-    for column in ["elevation_m", "slope_deg"]:
-        df[column] = df.groupby("region")[column].transform(
-            lambda x: x.fillna(x.median())
+        log.info(
+            "Data loaded | facilities: %d | hazard dates: %d",
+            len(cls.static_df),
+            cls.hazard_df["date"].nunique(),
         )
 
-    static_df = df[
-        ["facility_id", "name", "region", "facility_class", "lat", "lon"]
-        + STATIC_FEATURES
-    ].copy()
 
-    # Facilities lookup table needed by rainfall.py and soilmoisture.py
-    facilities = df[["facility_id", "lat", "lon"]]
-
-    print(f"Loaded {len(static_df):,} facilities from {path}")
-    return static_df, facilities
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Step 2 — Pull fresh GEE data
-# ─────────────────────────────────────────────────────────────────────────────
-
-def pull_fresh_features(facilities, run_date, rain_cache, sm_cache, ee_project):
+# ══════════════════════════════════════════════════════════════════════════════
+# SCORING HELPERS
+# ══════════════════════════════════════════════════════════════════════════════
+def score_features(X: np.ndarray) -> np.ndarray:
     """
-    Calls rainfall.py and soilmoisture.py to pull today's data from GEE.
-    Uses the cached baseline parquets so the 10-year history is not re-downloaded.
+    Pass a feature matrix through the pipeline and return normalised [0,1] scores.
+    Higher score = more anomalous = higher flood risk.
     """
-    # Write facilities to a temp CSV (both pipelines read from a file)
-    with tempfile.NamedTemporaryFile(mode="w", suffix=".csv", delete=False) as f:
-        facilities.to_csv(f, index=False)
-        temp_path = f.name
+    pipe = ModelStore.pipeline
+    Xs   = pipe.named_steps["scaler"].transform(X)
+    raw  = -pipe.named_steps["detector"].score_samples(Xs)
+    # Normalise using training score distribution
+    mn, mx = raw.min(), raw.max()
+    if mx - mn < 1e-9:
+        return np.full(len(raw), 0.5)
+    return np.clip((raw - mn) / (mx - mn), 0, 1)
 
+
+def classify(score: float) -> str:
+    if score >= 0.65:
+        return "High Risk"
+    if score >= 0.35:
+        return "Moderate Risk"
+    return "No Risk"
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PYDANTIC INPUT SCHEMA — one row of raw hazard + terrain features
+# Defaults represent neutral / no-event conditions so users only need to
+# change the values they care about when testing in the Swagger UI.
+# ══════════════════════════════════════════════════════════════════════════════
+class FacilityFeatures(BaseModel):
+    rain_1d:                  float = Field(0.0,  description="1-day rainfall (mm)")
+    rain_3d_sum:              float = Field(0.0,  description="3-day cumulative rainfall (mm)")
+    rain_7d_sum:              float = Field(0.0,  description="7-day cumulative rainfall (mm)")
+    rain_percentile:          float = Field(0.5,  description="Rainfall percentile vs climatology (0–1)")
+    rain_anomaly:             float = Field(0.0,  description="Rainfall anomaly vs climatology (mm)")
+    river_discharge_m3s:      float = Field(0.0,  description="River discharge (m³/s)")
+    discharge_percentile:     float = Field(0.5,  description="Discharge percentile (0–1)")
+    swi_raw:                  float = Field(0.5,  description="Soil water index (0–1)")
+    swi_absorption_deficit:   float = Field(0.5,  description="SWI absorption deficit (0–1)")
+    swi_7d_mean:              float = Field(0.5,  description="7-day mean SWI (0–1)")
+    swi_3d_trend:             float = Field(0.0,  description="3-day SWI trend")
+    swi_percentile:           float = Field(0.5,  description="SWI percentile (0–1)")
+    runoff_1d:                float = Field(0.0,  description="1-day surface runoff (mm)")
+    runoff_3d_sum:            float = Field(0.0,  description="3-day cumulative runoff (mm)")
+    runoff_7d_sum:            float = Field(0.0,  description="7-day cumulative runoff (mm)")
+    runoff_percentile:        float = Field(0.5,  description="Runoff percentile (0–1)")
+    water_accumulation_index: float = Field(0.5,  description="Terrain water accumulation index (0–1)")
+    dist_to_river_km:         float = Field(5.0,  description="Distance to nearest river (km)")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ROUTE HANDLERS — plain functions, registered explicitly below
+# ══════════════════════════════════════════════════════════════════════════════
+
+def predict_manual(payload: FacilityFeatures):
+    """
+    Enter raw feature values and get back a flood risk score and label.
+    All fields have defaults so you only need to fill in the values you want to test.
+    """
+    row   = [[getattr(payload, f) for f in FEATURES]]
+    X     = np.array(row, dtype=float)
+    score = float(score_features(X)[0])
+    return {
+        "final_score": round(score, 4),
+        "risk_class":  classify(score),
+        "model":       PRODUCTION_MODEL,
+    }
+
+
+def predict_date(
+    date: Optional[str] = Query(
+        None, description="YYYY-MM-DD — defaults to latest available date"
+    )
+):
+    """Score all facilities for a given date."""
     try:
-        print("\nStep 1/2 — Pulling rainfall data (rainfall.py)...")
-        import rainfall as rain_mod
-        rain_df = rain_mod.run_pipeline(
-            facilities_path     = temp_path,
-            run_date            = run_date,
-            baseline_cache_path = rain_cache,
-            ee_project          = ee_project,
+        results = run_predictions(date)
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    return {
+        "date":         results["date"].iloc[0],
+        "n_facilities": len(results),
+        "predictions":  results.to_dict(orient="records"),
+    }
+
+
+def high_risk(date: Optional[str] = Query(None, description="YYYY-MM-DD")):
+    """Return only High Risk facilities for a given date."""
+    try:
+        results = run_predictions(date)
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    high = results[results["risk_class"] == "High Risk"]
+    return {
+        "date":        results["date"].iloc[0],
+        "n_high_risk": len(high),
+        "facilities":  high.to_dict(orient="records"),
+    }
+
+
+def risk_summary(date: Optional[str] = Query(None, description="YYYY-MM-DD")):
+    """Risk count breakdown for a given date."""
+    try:
+        results = run_predictions(date)
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    counts = results["risk_class"].value_counts().to_dict()
+    return {
+        "date":          results["date"].iloc[0],
+        "total":         len(results),
+        "high_risk":     counts.get("High Risk",     0),
+        "moderate_risk": counts.get("Moderate Risk", 0),
+        "no_risk":       counts.get("No Risk",       0),
+        "mean_score":    round(float(results["final_score"].mean()), 4),
+    }
+
+
+def facility_detail(
+    facility_id: int,
+    date: Optional[str] = Query(None, description="YYYY-MM-DD"),
+):
+    """Full prediction detail for a single facility."""
+    try:
+        results = run_predictions(date)
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    row = results[results["facility_id"] == facility_id]
+    if row.empty:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Facility {facility_id} not found for this date.",
         )
-        print(f"  Done — {len(rain_df):,} facility rows")
-
-        print("\nStep 2/2 — Pulling soil moisture data (soilmoisture.py)...")
-        import soilmoisture as sm_mod
-        sm_df = sm_mod.run_pipeline(
-            facilities_path     = temp_path,
-            run_date            = run_date,
-            baseline_cache_path = sm_cache,
-            ee_project          = ee_project,
-        )
-        print(f"  Done — {len(sm_df):,} facility rows")
-
-    finally:
-        os.unlink(temp_path)
-
-    return rain_df, sm_df
+    return row.to_dict(orient="records")[0]
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Step 3 — Merge all sources
-# ─────────────────────────────────────────────────────────────────────────────
+def health():
+    """Model and data readiness check."""
+    m = ModelStore
+    return {
+        "status":      "ok" if m.pipeline is not None else "model not loaded",
+        "model":       PRODUCTION_MODEL,
+        "n_features":  len(FEATURES),
+        "n_facilities": len(m.static_df) if m.static_df is not None else 0,
+        "hazard_date_min": m.hazard_df["date"].min().date().isoformat() if m.hazard_df is not None else None,
+        "hazard_date_max": m.hazard_df["date"].max().date().isoformat() if m.hazard_df is not None else None,
+        "available_dates": m.hazard_df["date"].nunique() if m.hazard_df is not None else 0,
+    }
 
-def merge_all_sources(static_df, rain_df, sm_df):
-    """Joins rainfall, soil moisture, and static features into one table."""
-    dynamic = rain_df.merge(sm_df, on=["facility_id", "date"], how="inner")
 
-    merged = dynamic.merge(
-        static_df[["facility_id"] + STATIC_FEATURES + ["name", "region", "facility_class", "lat", "lon"]],
-        on="facility_id",
-        how="left",
+# ══════════════════════════════════════════════════════════════════════════════
+# BATCH PREDICTION (used by date-based endpoints)
+# ══════════════════════════════════════════════════════════════════════════════
+def run_predictions(target_date: Optional[str] = None) -> pd.DataFrame:
+    """
+    Score every facility for a given date from the hazard parquet.
+    Returns a DataFrame sorted by final_score descending.
+    """
+    m  = ModelStore
+    dt = pd.to_datetime(target_date) if target_date else m.hazard_df["date"].max()
+
+    daily = m.hazard_df[m.hazard_df["date"] == dt].copy()
+    if daily.empty:
+        raise ValueError(f"No hazard data available for {dt.date()}")
+
+    df          = daily.merge(m.static_df, on="facility_id", how="left")
+    feats_avail = [f for f in FEATURES if f in df.columns]
+
+    X               = df[feats_avail].fillna(0).values
+    df["final_score"] = score_features(X)
+    df["risk_class"]  = df["final_score"].apply(classify)
+    df["date"]        = dt.date().isoformat()
+
+    out_cols = [
+        "facility_id", "name", "region", "facility_type", "lat", "lon",
+        "date", "final_score", "risk_class",
+    ]
+    return (
+        df[[c for c in out_cols if c in df.columns]]
+        .sort_values("final_score", ascending=False)
+        .reset_index(drop=True)
     )
 
-    unmatched = merged[STATIC_FEATURES[0]].isna().sum()
-    print(f"\nMerged {len(merged):,} rows  (unmatched static: {unmatched})")
-    return merged
+
+# ══════════════════════════════════════════════════════════════════════════════
+# FASTAPI APP
+# ══════════════════════════════════════════════════════════════════════════════
+@asynccontextmanager
+async def lifespan(application: FastAPI):
+    ModelStore.load()
+    yield
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Step 4 — Load model from MLflow
-# ─────────────────────────────────────────────────────────────────────────────
+app = FastAPI(
+    title="Flood Early Warning System",
+    description=(
+        "Predicts flood-induced inaccessibility risk for Tanzanian primary "
+        "healthcare facilities using IsolationForest trained on CHIRPS rainfall "
+        "and GloFAS river-discharge features.\n\n"
+        "**Quick start:** Use `POST /predict/manual` to enter feature values "
+        "and get a risk score instantly."
+    ),
+    version="3.0",
+    lifespan=lifespan,
+)
 
-def load_model():
-    """Loads the latest trained model from MLflow."""
-    mlflow.set_tracking_uri(MLFLOW_DB)
-    print(f"\nLoading model '{MODEL_NAME}' from MLflow...")
-    model = mlflow.sklearn.load_model(f"models:/{MODEL_NAME}/{MODEL_VERSION}")
-    print("  Model loaded.")
-    return model
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Step 5 — Score all facilities
-# ─────────────────────────────────────────────────────────────────────────────
-
-def run_predictions(model, merged_df):
-    """
-    Runs the model on all facilities and adds prediction columns.
-
-    Adds:
-      predicted_alert   — the alert level (e.g. CUTOFF_HIGH)
-      confidence        — probability of the top class
-      prob_CUTOFF_HIGH
-      prob_CUTOFF_WATCH
-      prob_NO_ALERT
-    """
-    X = merged_df[ALL_FEATURES].values
-    predictions   = model.predict(X)
-    probabilities = model.predict_proba(X)
-
-    output = merged_df.copy()
-    output["predicted_alert"] = predictions
-    output["confidence"]      = probabilities.max(axis=1).round(4)
-
-    for i, class_name in enumerate(model.classes_):
-        output[f"prob_{class_name}"] = probabilities[:, i].round(4)
-
-    return output
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Step 6 — Save and summarise
-# ─────────────────────────────────────────────────────────────────────────────
-
-def save_and_summarise(predictions_df, run_date, output_path):
-    """Saves predictions to CSV and prints a summary."""
-    predictions_df.to_csv(output_path, index=False)
-    print(f"\nPredictions saved to {output_path}")
-
-    print(f"\nAlert summary for {run_date}:")
-    for alert, count in predictions_df["predicted_alert"].value_counts().items():
-        print(f"  {alert:<22} {count:>6}  ({count / len(predictions_df) * 100:.1f}%)")
-
-    # Show the high risk facilities
-    high_risk = predictions_df[predictions_df["predicted_alert"] == "CUTOFF_HIGH"]
-    if len(high_risk) > 0:
-        print(f"\nHigh risk facilities ({len(high_risk)}):")
-        display_cols = ["facility_id", "name", "region", "rain_7d_sum",
-                        "sm_percentile", "confidence"]
-        print(high_risk[[c for c in display_cols if c in high_risk.columns]]
-              .sort_values("confidence", ascending=False)
-              .to_string(index=False))
+# ── Explicit route registration (no decorators) ───────────────────────────────
+app.add_api_route(
+    "/predict/manual",
+    predict_manual,
+    methods=["POST"],
+    summary="Enter feature values → get risk score",
+    tags=["Manual Prediction"],
+)
+app.add_api_route(
+    "/predict",
+    predict_date,
+    methods=["GET"],
+    summary="Score all facilities for a date",
+    tags=["Batch Prediction"],
+)
+app.add_api_route(
+    "/risk/high",
+    high_risk,
+    methods=["GET"],
+    summary="High Risk facilities only",
+    tags=["Batch Prediction"],
+)
+app.add_api_route(
+    "/risk/summary",
+    risk_summary,
+    methods=["GET"],
+    summary="Risk count breakdown",
+    tags=["Batch Prediction"],
+)
+app.add_api_route(
+    "/facility/{facility_id}",
+    facility_detail,
+    methods=["GET"],
+    summary="Single facility detail",
+    tags=["Batch Prediction"],
+)
+app.add_api_route(
+    "/health",
+    health,
+    methods=["GET"],
+    summary="Model and data status",
+    tags=["Health"],
+)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Main
-# ─────────────────────────────────────────────────────────────────────────────
-
+# ══════════════════════════════════════════════════════════════════════════════
+# CLI MODE
+# ══════════════════════════════════════════════════════════════════════════════
 def main():
-    parser = argparse.ArgumentParser(
-        description="Run the full prediction pipeline — pulls GEE data and scores all facilities"
+    p = argparse.ArgumentParser(description="Flood EWS — CLI prediction")
+    p.add_argument("--static",     default=STATIC_FILE,           help="Path to facility CSV")
+    p.add_argument("--hazard",     default=HAZARD_FILE,           help="Path to daily hazard parquet")
+    p.add_argument("--date",       default=None,                  help="YYYY-MM-DD (default: latest)")
+    p.add_argument("--models_dir", default=MODELS_DIR,            help="Directory containing model artifacts")
+    p.add_argument("--output",     default="predictions.parquet", help="Output parquet path")
+    args = p.parse_args()
+
+    ModelStore.load(args.models_dir, args.static, args.hazard)
+    results = run_predictions(args.date)
+    results.to_parquet(args.output, index=False, compression="snappy")
+
+    log.info("Saved %d predictions -> %s", len(results), args.output)
+    print("\nRisk breakdown:")
+    print(results["risk_class"].value_counts().to_string())
+    print("\nTop 10:")
+    print(
+        results[["name", "region", "facility_type", "final_score", "risk_class"]]
+        .head(10)
+        .to_string(index=False)
     )
-    parser.add_argument("--static",      required=True, help="Path to hfr_data.csv")
-    parser.add_argument("--rain_cache",  required=True, help="Path to chirps_baseline.parquet")
-    parser.add_argument("--sm_cache",    required=True, help="Path to era5_baseline.parquet")
-    parser.add_argument("--ee_project",  required=True, help="Google Earth Engine project ID")
-    parser.add_argument("--run_date",    default=None,  help="Date to predict for (YYYY-MM-DD, default: today)")
-    parser.add_argument("--output",      default=None,  help="Output CSV path (default: predictions_YYYY-MM-DD.csv)")
-    args = parser.parse_args()
-
-    run_date = date.fromisoformat(args.run_date) if args.run_date else date.today()
-    output_path = args.output or f"predictions_{run_date}.csv"
-
-    print(f"\n{'='*62}")
-    print(f"  Prediction run for : {run_date}")
-    print(f"  Output             : {output_path}")
-    print(f"{'='*62}")
-
-    # Load static features
-    print("\n── STEP 1: LOADING STATIC FEATURES ───────────────────────")
-    static_df, facilities = load_static_features(args.static)
-
-    # Pull fresh GEE data
-    print("\n── STEP 2: PULLING FRESH GEE DATA ────────────────────────")
-    rain_df, sm_df = pull_fresh_features(
-        facilities,
-        run_date    = run_date,
-        rain_cache  = args.rain_cache,
-        sm_cache    = args.sm_cache,
-        ee_project  = args.ee_project,
-    )
-
-    # Merge
-    print("\n── STEP 3: MERGING ────────────────────────────────────────")
-    merged = merge_all_sources(static_df, rain_df, sm_df)
-
-    # Load model
-    print("\n── STEP 4: LOADING MODEL ──────────────────────────────────")
-    model = load_model()
-
-    # Score
-    print("\n── STEP 5: SCORING FACILITIES ─────────────────────────────")
-    predictions = run_predictions(model, merged)
-
-    # Save
-    print("\n── STEP 6: SAVING RESULTS ─────────────────────────────────")
-    save_and_summarise(predictions, run_date, output_path)
 
 
 if __name__ == "__main__":
