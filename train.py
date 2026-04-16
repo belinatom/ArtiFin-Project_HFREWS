@@ -32,7 +32,14 @@ ALL = DYNAMIC + STATIC
 
 
 # ── STEP 2: MLFLOW SETUP ──────────────────────────────────────────────────────────────────────
-def setup_mlflow(project_dir: Path, experiment_name: str = "ArtifinProj_HFREWS"):
+def setup_mlflow(project_dir: Path, experiment_name: str = "ArtifinProj_HFREWS_fresh"):
+    """
+    Point MLflow at a local SQLite file in the project directory.
+    Using a plain file path (no as_posix(), no absolute URI construction)
+    ensures the UI command works on Windows without path issues.
+    """
+    # Use as_posix() so Windows backslashes don't break the SQLite URI
+    # e.g. sqlite:///C:/Users/belin/.../mlflow.db  (forward slashes required)
     db_path      = (project_dir / "mlflow.db").as_posix()
     tracking_uri = f"sqlite:///{db_path}"
 
@@ -44,20 +51,19 @@ def setup_mlflow(project_dir: Path, experiment_name: str = "ArtifinProj_HFREWS")
         "db_path": db_path,
         "experiment_name": experiment_name,
     }
-    """ Points MLflow to a local SQLite file in the project directory with the models. """
+
 
 # ── STEP 3: FEATURE NORMALISATION ────────────────────────────────────────────────────────────
 def mm(s):
+    """Min-max normalise a Series; returns 0.5 for zero-variance/all-NaN columns."""
     mn = s.min()
     mx = s.max()
     if pd.isna(mn) or pd.isna(mx) or (mx - mn) < 1e-9:
         return pd.Series(0.5, index=s.index)
     return (s - mn) / (mx - mn)
-"""Min-max normalise a Series; returns 0.5 for zero-variance/all-NaN columns."""
+
 
 # ── STEP 4: INDEX COMPUTATION (dynamic = facility-specific, static = global) ─────────────────
-''' Computes index for risk scoring'''
-
 def compute_indices(df):
     d = df.copy()
 
@@ -100,8 +106,8 @@ def compute_indices(df):
 
     return d
 
+
 # ── STEP 5: PROXY LABELS (rule-based, per-facility percentiles) ───────────────────────────────
-''' A function to compute score and thresholds for rule based risk score'''
 def label_rows(df):
     d = df.copy()
 
@@ -138,7 +144,8 @@ def label_rows(df):
 
     return d
 
-# ── STEP 6: MODEL EVALUATION METRICS (ANOMALY DETECTION) ───────────────────────────────────────────────────────────────────────────
+
+# ── STEP 6: METRICS ───────────────────────────────────────────────────────────────────────────
 def compute_metrics(labels, flags, final_scores):
     y_true_high = (labels == "HIGH").astype(int).values
     y_true_any = (labels != "NO_ALERT").astype(int).values
@@ -205,11 +212,12 @@ def evaluate_model_performance(d):
 
     return corr
 
+
 # ── STEP 8: GLOBAL EXPERIMENT RUNNER ─────────────────────────────────────────────────────────
 def run_experiment(df, feats, contamination, out_dir, exp_label):
     """
-    Trains one IsolationForest on the full dataset, scores every row, log
-    everything to MLflow, and saves the pipeline locally.
+    Train one IsolationForest on the full dataset, score every row, log
+    everything to MLflow, and save the pipeline locally.
     """
     use_terrain = any(c in feats for c in STATIC)
     feature_tag = "dynamic+terrain" if use_terrain else "dynamic"
